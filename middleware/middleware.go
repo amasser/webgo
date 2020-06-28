@@ -8,27 +8,13 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/bnkamalesh/webgo/v3"
+	"github.com/bnkamalesh/webgo/v4"
 )
-
-// responseWriter is a custom HTTP response writer
-type responseWriter struct {
-	http.ResponseWriter
-	code int
-}
-
-func (rw *responseWriter) WriteHeader(code int) {
-	rw.code = code
-	rw.ResponseWriter.WriteHeader(code)
-}
 
 // AccessLog is a middleware which prints access log to stdout
 func AccessLog(rw http.ResponseWriter, req *http.Request, next http.HandlerFunc) {
 	start := time.Now()
-	w := &responseWriter{
-		ResponseWriter: rw,
-	}
-	next(w, req)
+	next(rw, req)
 	end := time.Now()
 
 	webgo.LOGHANDLER.Info(
@@ -38,7 +24,7 @@ func AccessLog(rw http.ResponseWriter, req *http.Request, next http.HandlerFunc)
 			req.Method,
 			req.URL.String(),
 			end.Sub(start).String(),
-			w.code,
+			webgo.ResponseStatus(rw),
 		),
 	)
 }
@@ -54,8 +40,13 @@ const (
 	allowHeaders       = "Accept,Content-Type,Content-Length,Accept-Encoding,Access-Control-Request-Headers,"
 )
 
+func deprecationLog() {
+	webgo.LOGHANDLER.Warn("this middleware is deprecated, use github.com/bnkamalesh/middleware/cors")
+}
+
 // Cors is a basic CORS middleware which can be added to individual handlers
 func Cors(allowedOrigins ...string) http.HandlerFunc {
+	deprecationLog()
 	if len(allowedOrigins) == 0 {
 		allowedOrigins = append(allowedOrigins, "*")
 	}
@@ -87,6 +78,7 @@ func Cors(allowedOrigins ...string) http.HandlerFunc {
 
 // CorsOptions is a CORS middleware only for OPTIONS request method
 func CorsOptions(allowedOrigins ...string) http.HandlerFunc {
+	deprecationLog()
 	if len(allowedOrigins) == 0 {
 		allowedOrigins = append(allowedOrigins, "*")
 	}
@@ -117,6 +109,7 @@ func CorsOptions(allowedOrigins ...string) http.HandlerFunc {
 
 // CorsWrap is a single Cors middleware which can be applied to the whole app at once
 func CorsWrap(allowedOrigins ...string) func(http.ResponseWriter, *http.Request, http.HandlerFunc) {
+	deprecationLog()
 	if len(allowedOrigins) == 0 {
 		allowedOrigins = append(allowedOrigins, "*")
 	}

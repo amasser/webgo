@@ -25,22 +25,6 @@ type errOutput struct {
 	Status int         `json:"status"`
 }
 
-// responseWriter is a custom HTTP response writer for JSON response
-type responseWriter struct {
-	http.ResponseWriter
-	code int
-}
-
-func (rw responseWriter) Write(data []byte) (int, error) {
-	rw.WriteHeader(rw.code)
-	return rw.ResponseWriter.Write(data)
-}
-
-func (rw responseWriter) WriteHeader(code int) {
-	rw.ResponseWriter.Header().Set(HeaderContentType, JSONContentType)
-	rw.ResponseWriter.WriteHeader(code)
-}
-
 const (
 	// HeaderContentType is the key for mentioning the response header content type
 	HeaderContentType = "Content-Type"
@@ -50,7 +34,7 @@ const (
 	HTMLContentType = "text/html; charset=UTF-8"
 
 	// ErrInternalServer to send when there's an internal server error
-	ErrInternalServer = "Internal server error."
+	ErrInternalServer = "Internal server error"
 )
 
 // SendHeader is used to send only a response header, i.e no response body
@@ -58,62 +42,70 @@ func SendHeader(w http.ResponseWriter, rCode int) {
 	w.WriteHeader(rCode)
 }
 
+func crwAsserter(w http.ResponseWriter, rCode int) http.ResponseWriter {
+	if crw, ok := w.(*customResponseWriter); ok {
+		crw.statusCode = rCode
+		return crw
+	}
+
+	return newCRW(w, rCode)
+}
+
 // Send sends a completely custom response without wrapping in the
 // `{data: <data>, status: <int>` struct
 func Send(w http.ResponseWriter, contentType string, data interface{}, rCode int) {
+	w = crwAsserter(w, rCode)
+
 	w.Header().Set(HeaderContentType, contentType)
-	w.WriteHeader(rCode)
 	_, err := fmt.Fprint(w, data)
 	if err != nil {
-		R500(w, ErrInternalServer)
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(ErrInternalServer))
+		LOGHANDLER.Error(err)
 	}
 }
 
 // SendResponse is used to respond to any request (JSON response) based on the code, data etc.
 func SendResponse(w http.ResponseWriter, data interface{}, rCode int) {
-	rw := responseWriter{
-		ResponseWriter: w,
-		code:           rCode,
-	}
-
-	err := json.NewEncoder(rw).Encode(dOutput{Data: data, Status: rCode})
+	w = crwAsserter(w, rCode)
+	w.Header().Add(HeaderContentType, JSONContentType)
+	err := json.NewEncoder(w).Encode(dOutput{Data: data, Status: rCode})
 	if err != nil {
 		/*
-			In case of encoding error, send "internal server error" after
-			logging the actual error.
+			In case of encoding error, send "internal server error" and
+			log the actual error.
 		*/
-		LOGHANDLER.Error(err)
 		R500(w, ErrInternalServer)
+		LOGHANDLER.Error(err)
 	}
 }
 
 // SendError is used to respond to any request with an error
 func SendError(w http.ResponseWriter, data interface{}, rCode int) {
-	rw := responseWriter{
-		ResponseWriter: w,
-		code:           rCode,
-	}
-
-	err := json.NewEncoder(rw).Encode(errOutput{data, rCode})
+	w = crwAsserter(w, rCode)
+	w.Header().Add(HeaderContentType, JSONContentType)
+	err := json.NewEncoder(w).Encode(errOutput{data, rCode})
 	if err != nil {
 		/*
-			In case of encoding error, send "internal server error" after
-			logging the actual error.
+			In case of encoding error, send "internal server error" and
+			log the actual error.
 		*/
-		LOGHANDLER.Error(err)
 		R500(w, ErrInternalServer)
+		LOGHANDLER.Error(err)
 	}
 }
 
 // Render is used for rendering templates (HTML)
 func Render(w http.ResponseWriter, data interface{}, rCode int, tpl *template.Template) {
+	w = crwAsserter(w, rCode)
+
 	// In case of HTML response, setting appropriate header type for text/HTML response
 	w.Header().Set(HeaderContentType, HTMLContentType)
-	w.WriteHeader(rCode)
 
 	// Rendering an HTML template with appropriate data
 	err := tpl.Execute(w, data)
 	if err != nil {
+		Send(w, "text/plain", ErrInternalServer, http.StatusInternalServerError)
 		LOGHANDLER.Error(err.Error())
 	}
 }

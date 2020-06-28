@@ -4,8 +4,10 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
+	"sync"
 )
 
 // urlchars is regex to validate characters in a URI parameter
@@ -22,31 +24,45 @@ const (
 	errDuplicateKey     = `Error: Duplicate URI keys found`
 )
 
-var validHTTPMethods = []string{
-	http.MethodOptions,
-	http.MethodHead,
-	http.MethodGet,
-	http.MethodPost,
-	http.MethodPut,
-	http.MethodPatch,
-	http.MethodDelete,
-}
+var (
+	validHTTPMethods = []string{
+		http.MethodOptions,
+		http.MethodHead,
+		http.MethodGet,
+		http.MethodPost,
+		http.MethodPut,
+		http.MethodPatch,
+		http.MethodDelete,
+	}
+
+	ctxPool = &sync.Pool{
+		New: func() interface{} {
+			return new(ContextPayload)
+		},
+	}
+	crwPool = &sync.Pool{
+		New: func() interface{} {
+			return new(customResponseWriter)
+		},
+	}
+)
 
 // customResponseWriter is a custom HTTP response writer
 type customResponseWriter struct {
 	http.ResponseWriter
-	statusCode int
-	written    bool
+	statusCode    int
+	written       bool
+	headerWritten bool
 }
 
 // WriteHeader is the interface implementation to get HTTP response code and add
 // it to the custom response writer
 func (crw *customResponseWriter) WriteHeader(code int) {
-	if crw.written {
-		LOGHANDLER.Warn(errMultiHeaderWrite)
+	if crw.written || crw.headerWritten {
 		return
 	}
 
+	crw.headerWritten = true
 	crw.statusCode = code
 	crw.ResponseWriter.WriteHeader(code)
 }
@@ -58,6 +74,8 @@ func (crw *customResponseWriter) Write(body []byte) (int, error) {
 		LOGHANDLER.Warn(errMultiWrite)
 		return 0, nil
 	}
+
+	crw.WriteHeader(crw.statusCode)
 
 	crw.written = true
 	return crw.ResponseWriter.Write(body)
@@ -72,11 +90,40 @@ func (crw *customResponseWriter) Flush() {
 
 // Hijack implements the http.Hijacker interface
 func (crw *customResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
-	hj, ok := crw.ResponseWriter.(http.Hijacker)
-	if !ok {
-		return nil, nil, errors.New("unable to create hijacker")
+	if hj, ok := crw.ResponseWriter.(http.Hijacker); ok {
+		return hj.Hijack()
 	}
-	return hj.Hijack()
+
+	return nil, nil, errors.New("unable to create hijacker")
+}
+
+// CloseNotify implements the http.CloseNotifier interface
+func (crw *customResponseWriter) CloseNotify() <-chan bool {
+	if n, ok := crw.ResponseWriter.(http.CloseNotifier); ok {
+		return n.CloseNotify()
+	}
+	return nil
+}
+
+func (crw *customResponseWriter) reset() {
+	crw.statusCode = 0
+	crw.written = false
+	crw.headerWritten = false
+	crw.ResponseWriter = nil
+}
+
+// Middleware is the signature of WebGo's middleware
+type Middleware func(http.ResponseWriter, *http.Request, http.HandlerFunc)
+
+// discoverRoute returns the correct 'route', for the given request
+func discoverRoute(path string, routes []*Route) *Route {
+	// ok := false
+	for _, route := range routes {
+		if ok, _ := route.matchPath(path); ok {
+			return route
+		}
+	}
+	return nil
 }
 
 // Router is the HTTP router
@@ -96,10 +143,6 @@ type Router struct {
 	// NotImplemented is the generic handler for 501 method not implemented
 	NotImplemented http.HandlerFunc
 
-	// AppContext holds all the app specific context which is to be injected into all HTTP
-	// request context
-	AppContext map[string]interface{}
-
 	// config has all the app config
 	config *Config
 
@@ -109,14 +152,35 @@ type Router struct {
 	httpsServer *http.Server
 }
 
-func (rtr *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	w = &customResponseWriter{
-		ResponseWriter: w,
+// methodRoutes returns the list of Routes handling the HTTP method given the request
+func (rtr *Router) methodRoutes(r *http.Request) (routes []*Route) {
+	switch r.Method {
+	case http.MethodOptions:
+		return rtr.optHandlers
+	case http.MethodHead:
+		return rtr.headHandlers
+	case http.MethodGet:
+		return rtr.getHandlers
+	case http.MethodPost:
+		return rtr.postHandlers
+	case http.MethodPut:
+		return rtr.putHandlers
+	case http.MethodPatch:
+		return rtr.patchHandlers
+	case http.MethodDelete:
+		return rtr.deleteHandlers
 	}
 
-	ctxPayload := &ContextPayload{
-		AppContext: rtr.AppContext,
-	}
+	return nil
+}
+
+func (rtr *Router) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
+	// a custom response writer is used to set appropriate HTTP status code in case of
+	// encoding errors. i.e. if there's a JSON encoding issue while responding,
+	// the HTTP status code would say 200, and and the JSON payload {"status": 500}
+	crw := newCRW(rw, http.StatusOK)
+
+	ctxPayload := newContext()
 
 	// webgo context object is created and is injected to the request context
 	*r = *r.WithContext(
@@ -127,50 +191,32 @@ func (rtr *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		),
 	)
 
-	var routes []*Route
-
-	switch r.Method {
-	case http.MethodOptions:
-		routes = rtr.optHandlers
-	case http.MethodHead:
-		routes = rtr.headHandlers
-	case http.MethodGet:
-		routes = rtr.getHandlers
-	case http.MethodPost:
-		routes = rtr.postHandlers
-	case http.MethodPut:
-		routes = rtr.putHandlers
-	case http.MethodPatch:
-		routes = rtr.patchHandlers
-	case http.MethodDelete:
-		routes = rtr.deleteHandlers
-	}
-
+	routes := rtr.methodRoutes(r)
 	if routes == nil {
-		rtr.NotImplemented(w, r)
+		crw.statusCode = http.StatusNotImplemented
+		rtr.NotImplemented(crw, r)
+		releasePoolResources(crw, ctxPayload)
 		return
 	}
 
-	ok := false
 	path := r.URL.EscapedPath()
-	for _, route := range routes {
-		if ok, ctxPayload.Params = route.matchAndGet(path); ok {
-			ctxPayload.Route = route
-			break
-		}
-	}
-
-	if !ok {
+	route := discoverRoute(
+		path,
+		routes,
+	)
+	ctxPayload.path = path
+	if route == nil {
 		// serve 404 when there are no matching routes
-		rtr.NotFound(w, r)
+		crw.statusCode = http.StatusNotFound
+		rtr.NotFound(crw, r)
+		releasePoolResources(crw, ctxPayload)
 		return
 	}
 
-	ctxPayload.Route.serve(w, r)
+	ctxPayload.Route = route
+	route.serve(crw, r)
+	releasePoolResources(crw, ctxPayload)
 }
-
-// Middleware is the signature of WebGo's middleware
-type Middleware func(http.ResponseWriter, *http.Request, http.HandlerFunc)
 
 // Use adds a middleware layer
 func (rtr *Router) Use(f Middleware) {
@@ -207,7 +253,33 @@ func (rtr *Router) UseOnSpecialHandlers(f Middleware) {
 	}
 }
 
-// NewRouter initializes returns a new router instance with all the configurations and routes set
+func newCRW(rw http.ResponseWriter, rCode int) *customResponseWriter {
+	crw := crwPool.Get().(*customResponseWriter)
+	crw.ResponseWriter = rw
+	crw.statusCode = rCode
+	return crw
+}
+
+func releaseCRW(crw *customResponseWriter) {
+	crw.reset()
+	crwPool.Put(crw)
+}
+
+func newContext() *ContextPayload {
+	return ctxPool.Get().(*ContextPayload)
+}
+
+func releaseContext(cp *ContextPayload) {
+	cp.reset()
+	ctxPool.Put(cp)
+}
+
+func releasePoolResources(crw *customResponseWriter, cp *ContextPayload) {
+	releaseCRW(crw)
+	releaseContext(cp)
+}
+
+// NewRouter initializes & returns a new router instance with all the configurations and routes set
 func NewRouter(cfg *Config, routes []*Route) *Router {
 	handlers := httpHandlers(routes)
 	r := &Router{
@@ -237,16 +309,31 @@ func checkDuplicateRoutes(idx int, route *Route, routes []*Route) {
 		rt := routes[i]
 
 		if rt.Name == route.Name {
-			LOGHANDLER.Warn("Duplicate route name(\"" + rt.Name + "\") detected. Route name should be unique.")
+			LOGHANDLER.Info(
+				fmt.Sprintf(
+					"Duplicate route name('%s') detected",
+					rt.Name,
+				),
+			)
 		}
 
-		if rt.Method == route.Method {
-			// regex pattern match
-			if ok, _ := rt.matchAndGet(route.Pattern); ok {
-				LOGHANDLER.Warn("Duplicate URI pattern detected.\nPattern: '" + rt.Pattern + "'\nDuplicate pattern: '" + route.Pattern + "'")
-				LOGHANDLER.Info("Only the first route to match the URI pattern would handle the request")
-			}
+		if rt.Method != route.Method {
+			continue
 		}
+
+		// regex pattern match
+		if ok, _ := rt.matchPath(route.Pattern); !ok {
+			continue
+		}
+
+		LOGHANDLER.Warn(
+			fmt.Sprintf(
+				"Duplicate URI pattern detected.\nPattern: '%s'\nDuplicate pattern: '%s'",
+				rt.Pattern,
+				route.Pattern,
+			),
+		)
+		LOGHANDLER.Warn("Only the first route to match the URI pattern would handle the request")
 	}
 }
 
@@ -267,12 +354,23 @@ func httpHandlers(routes []*Route) map[string][]*Route {
 		}
 
 		if !found {
-			LOGHANDLER.Fatal("Unsupported HTTP request method provided. Method:", route.Method)
+			LOGHANDLER.Fatal(
+				fmt.Sprintf(
+					"Unsupported HTTP method provided. Method: '%s'",
+					route.Method,
+				),
+			)
 			return nil
 		}
 
 		if route.Handlers == nil || len(route.Handlers) == 0 {
-			LOGHANDLER.Fatal("No handlers provided for the route '", route.Pattern, "', method '", route.Method, "'")
+			LOGHANDLER.Fatal(
+				fmt.Sprintf(
+					"No handlers provided for the route '%s', method '%s'",
+					route.Pattern,
+					route.Method,
+				),
+			)
 			return nil
 		}
 

@@ -84,6 +84,10 @@ func TestInvalidResponses(t *testing.T) {
 		t.Error("Expected status 500, got:", resp.Status)
 	}
 
+	if respRec.Result().StatusCode != http.StatusInternalServerError {
+		t.Error("Expected status 500, got:", respRec.Result().StatusCode)
+	}
+
 	_, respRec = setup()
 
 	R400(respRec, make(chan int))
@@ -96,6 +100,10 @@ func TestInvalidResponses(t *testing.T) {
 
 	if resp.Status != http.StatusInternalServerError {
 		t.Error("Expected status 500, got:", resp.Status)
+	}
+
+	if respRec.Result().StatusCode != http.StatusInternalServerError {
+		t.Error("Expected status 500, got:", respRec.Result().StatusCode)
 	}
 }
 
@@ -111,7 +119,6 @@ func TestSend(t *testing.T) {
 	if str != "hello" {
 		t.Error("Expected 'hello', got", str)
 	}
-
 }
 
 func TestRender(t *testing.T) {
